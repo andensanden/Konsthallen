@@ -6,6 +6,15 @@ PLANEIDCOUNTER = 0
 base_dict ={1:(198.3,335) ,2:(838,3,75,), 3: (1158.3,385), 4: (1398.3,1071.7), 5: (321.7,1238.3), 6: (918.3,835)} 
 
 def create_planes(base_number, number_of_planes):
+    """
+    Skapar en lista av plan objekt.
+
+    Args:
+        base_number (int): Vilken bas kommer planet tillhörs? North eller South?
+        number_of_planes (int): Hur många plan objekt som ska skapas.
+    Returns:
+        En lista av plan object.
+    """
     global PLANEIDCOUNTER
     planes = []
     for i in range(number_of_planes):
