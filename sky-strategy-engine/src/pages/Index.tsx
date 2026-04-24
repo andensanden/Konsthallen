@@ -8,7 +8,12 @@ import { Badge } from "@/components/ui/badge";
 import { createInitialState, DEFAULT_PARAMS } from "@/game/initial";
 import { GameState, SimParams } from "@/game/types";
 import { tick } from "@/game/engine";
-import { bestMoveFor, runAITick } from "@/game/ai";
+import { allMovesFor, runAITick, Suggestion } from "@/game/ai";
+import { applyPlan, CoordinatedPlan, rankedPlansFor } from "@/game/strategy";
+import { AdvisorPanel } from "@/components/AdvisorPanel";
+import { ManualOrderPanel } from "@/components/ManualOrderPanel";
+import { launchFlight, findBase, findTarget } from "@/game/engine";
+import { MissionKind } from "@/game/types";
 import { Pause, Play, RotateCcw, Gauge, Sliders } from "lucide-react";
 
 const Index = () => {
@@ -68,8 +73,67 @@ const Index = () => {
   const setSpeed = (sp: number) => setState((s) => ({ ...s, speed: sp }));
   const reset = () => setState(createInitialState(params));
 
-  const northSuggestion = useMemo(() => bestMoveFor(state, "north"), [state]);
-  const southSuggestion = useMemo(() => bestMoveFor(state, "south"), [state]);
+  const northMoves = useMemo(() => allMovesFor(state, "north"), [state]);
+  const southMoves = useMemo(() => allMovesFor(state, "south"), [state]);
+  // Lookahead is expensive — recompute on a slow tick (every ~1s of sim time)
+  const planTick = Math.floor(state.time);
+  const northPlans = useMemo(() => rankedPlansFor(state, "north"), [planTick, state.bases.length, state.flights.length]);
+  const southPlans = useMemo(() => rankedPlansFor(state, "south"), [planTick, state.bases.length, state.flights.length]);
+
+  const executeSuggestion = (sug: Suggestion) => {
+    setState((s) => {
+      const cloned: GameState = {
+        ...s,
+        cities: s.cities.map((c) => ({ ...c })),
+        bases: s.bases.map((b) => ({ ...b })),
+        flights: s.flights.map((f) => ({ ...f, pos: { ...f.pos }, origin: { ...f.origin }, dest: { ...f.dest } })),
+        log: [...s.log],
+      };
+      sug.apply(cloned);
+      stateRef.current = cloned;
+      return cloned;
+    });
+  };
+
+  const executePlan = (plan: CoordinatedPlan) => {
+    setState((s) => {
+      const cloned: GameState = {
+        ...s,
+        cities: s.cities.map((c) => ({ ...c })),
+        bases: s.bases.map((b) => ({ ...b })),
+        flights: s.flights.map((f) => ({ ...f, pos: { ...f.pos }, origin: { ...f.origin }, dest: { ...f.dest } })),
+        log: [...s.log],
+      };
+      applyPlan(cloned, plan);
+      stateRef.current = cloned;
+      return cloned;
+    });
+  };
+
+  const dispatchManual = (order: {
+    fromBaseId: string;
+    targetId: string;
+    kind: MissionKind;
+    fighters: number;
+    bombers: number;
+  }) => {
+    setState((s) => {
+      const cloned: GameState = {
+        ...s,
+        cities: s.cities.map((c) => ({ ...c })),
+        bases: s.bases.map((b) => ({ ...b })),
+        flights: s.flights.map((f) => ({ ...f, pos: { ...f.pos }, origin: { ...f.origin }, dest: { ...f.dest } })),
+        log: [...s.log],
+      };
+      const base = findBase(cloned, order.fromBaseId);
+      const target = findTarget(cloned, order.targetId);
+      if (base && target) {
+        launchFlight(cloned, base, target, order.kind, order.fighters, order.bombers);
+      }
+      stateRef.current = cloned;
+      return cloned;
+    });
+  };
 
   const hovered = useMemo(() => {
     if (!hoverId) return null;
@@ -97,7 +161,7 @@ const Index = () => {
       <header className="border-b border-border px-4 py-3 flex items-center justify-between">
         <div>
           <h1 className="text-lg font-semibold tracking-wide">Boreal Passage — Air Theater</h1>
-          <p className="text-xs text-muted-foreground">Observer mode · heuristic strategy advisor</p>
+          <p className="text-xs text-muted-foreground">South: Monte Carlo attacker · North: risk-min defender</p>
         </div>
         <div className="flex items-center gap-2">
           <Button size="sm" variant="secondary" onClick={togglePause}>
@@ -166,10 +230,32 @@ const Index = () => {
             <FactionStat label="South" color="south" data={totals.south} />
           </div>
 
-          <div className="p-3 border-b border-border space-y-2">
-            <p className="text-[10px] uppercase tracking-widest text-muted-foreground">Strategy Advisor</p>
-            <SuggestionRow label="North" sug={northSuggestion} color="north" />
-            <SuggestionRow label="South" sug={southSuggestion} color="south" />
+          <div className="border-b border-border max-h-[55vh] overflow-y-auto">
+            <div className="p-3 space-y-2">
+              <div className="flex items-center justify-between">
+                <p className="text-[10px] uppercase tracking-widest text-muted-foreground">
+                  Strategy Advisor
+                </p>
+                <p className="text-[9px] text-muted-foreground">
+                  two-sided AI · click Run to override
+                </p>
+              </div>
+              <AdvisorPanel
+                faction="north"
+                suggestions={northMoves}
+                plans={northPlans}
+                onExecute={executeSuggestion}
+                onExecutePlan={executePlan}
+              />
+              <AdvisorPanel
+                faction="south"
+                suggestions={southMoves}
+                plans={southPlans}
+                onExecute={executeSuggestion}
+                onExecutePlan={executePlan}
+              />
+              <ManualOrderPanel state={state} onDispatch={dispatchManual} />
+            </div>
           </div>
 
           {hovered && (
@@ -235,29 +321,5 @@ function FactionStat({
   );
 }
 
-function SuggestionRow({
-  label,
-  sug,
-  color,
-}: {
-  label: string;
-  sug: ReturnType<typeof bestMoveFor>;
-  color: "north" | "south";
-}) {
-  const text = color === "north" ? "text-north" : "text-south";
-  return (
-    <div className="text-xs">
-      <span className={`font-medium ${text}`}>{label}: </span>
-      {sug ? (
-        <span>
-          {sug.description}{" "}
-          <span className="text-muted-foreground">({sug.score.toFixed(0)})</span>
-        </span>
-      ) : (
-        <span className="text-muted-foreground">holding position</span>
-      )}
-    </div>
-  );
-}
 
 export default Index;
