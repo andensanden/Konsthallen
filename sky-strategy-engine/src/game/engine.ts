@@ -235,8 +235,19 @@ export function tick(s: GameState, dt: number) {
       if (dist(f.pos, targetFlight.pos) < 18) {
         s.flights = s.flights.filter((x) => x !== f);
         midairCombat(s, f, targetFlight);
+        // If the target attacker was wiped out, remove it (and its path) from the map
+        if (targetFlight.fighters + targetFlight.bombers <= 0) {
+          s.flights = s.flights.filter((x) => x !== targetFlight);
+          log(s, `Attacking flight wiped out mid-air.`, targetFlight.faction);
+        }
         continue;
       }
+    }
+
+    // Any flight that has lost all aircraft is removed (no ghost paths)
+    if (f.fighters + f.bombers <= 0) {
+      s.flights = s.flights.filter((x) => x !== f);
+      continue;
     }
 
     if (f.progress >= 1) {

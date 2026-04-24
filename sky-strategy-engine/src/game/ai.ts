@@ -1,10 +1,20 @@
 import { dist, fuelNeeded, launchFlight, log } from "./engine";
 import { AirBase, City, Faction, Flight, GameState } from "./types";
+import { applyPlan, bestPlanFor, rankedPlansFor } from "./strategy";
+
+export type SuggestionKind = "transfer" | "attack_base" | "attack_city";
 
 export interface Suggestion {
   score: number;
   faction: Faction;
+  kind: SuggestionKind;
   description: string;
+  fromBaseId: string;
+  fromBaseName: string;
+  targetId: string;
+  targetName: string;
+  fighters: number;
+  bombers: number;
   apply: (s: GameState) => void;
 }
 
@@ -30,10 +40,9 @@ function reachable(s: GameState, from: AirBase, target: AirBase | City, roundTri
 }
 
 /**
- * Compute the best suggestion for a given faction and optionally apply it.
- * Heuristic: enumerate (base, target, fighters, bombers) combos with simple sizing rules.
+ * Enumerate all candidate moves for a faction, scored and sorted descending.
  */
-export function bestMoveFor(s: GameState, faction: Faction): Suggestion | null {
+export function allMovesFor(s: GameState, faction: Faction): Suggestion[] {
   const myBases = s.bases.filter((b) => b.faction === faction && b.hp > 0);
   const enemyBases = s.bases.filter((b) => b.faction !== faction && b.hp > 0);
   const enemyCities = s.cities.filter((c) => c.faction !== faction && c.hp > 0);
@@ -53,7 +62,14 @@ export function bestMoveFor(s: GameState, faction: Faction): Suggestion | null {
       candidates.push({
         score,
         faction,
+        kind: "transfer",
         description: `Reinforce ${ally.name} from ${base.name} (${send}F)`,
+        fromBaseId: base.id,
+        fromBaseName: base.name,
+        targetId: ally.id,
+        targetName: ally.name,
+        fighters: send,
+        bombers: 0,
         apply: (st) => {
           const b = st.bases.find((x) => x.id === base.id)!;
           const a = st.bases.find((x) => x.id === ally.id)!;
@@ -79,7 +95,14 @@ export function bestMoveFor(s: GameState, faction: Faction): Suggestion | null {
       candidates.push({
         score,
         faction,
+        kind: "attack_base",
         description: `Strike ${eb.name} from ${base.name} (${escort}F + ${useB}B)`,
+        fromBaseId: base.id,
+        fromBaseName: base.name,
+        targetId: eb.id,
+        targetName: eb.name,
+        fighters: escort,
+        bombers: useB,
         apply: (st) => {
           const b = st.bases.find((x) => x.id === base.id)!;
           const t = st.bases.find((x) => x.id === eb.id)!;
@@ -102,7 +125,14 @@ export function bestMoveFor(s: GameState, faction: Faction): Suggestion | null {
       candidates.push({
         score,
         faction,
+        kind: "attack_city",
         description: `Raid ${ec.name} from ${base.name} (${escort}F + ${useB}B)`,
+        fromBaseId: base.id,
+        fromBaseName: base.name,
+        targetId: ec.id,
+        targetName: ec.name,
+        fighters: escort,
+        bombers: useB,
         apply: (st) => {
           const b = st.bases.find((x) => x.id === base.id)!;
           const t = st.cities.find((x) => x.id === ec.id)!;
@@ -130,16 +160,36 @@ export function bestMoveFor(s: GameState, faction: Faction): Suggestion | null {
   }
 
   candidates.sort((a, b) => b.score - a.score);
-  return candidates[0] ?? null;
+  return candidates;
 }
 
-/** Run AI cadence — both sides think on their own clocks */
+/** Best single suggestion for a faction (top of allMovesFor). */
+export function bestMoveFor(s: GameState, faction: Faction): Suggestion | null {
+  return allMovesFor(s, faction)[0] ?? null;
+}
+
+/**
+ * Run AI cadence — two distinct AIs.
+ *
+ *  SOUTH (attacker): Monte Carlo rollout planner.
+ *    - Launches scheduled waves with the best multi-base coordinated plan
+ *    - Between waves, opportunistically presses if mean rollout shows clear gain
+ *
+ *  NORTH (defender): Risk-minimizing reactive defender.
+ *    - Reinforces threatened bases first; counter-strikes only when safe
+ *    - Always keeps a fighter reserve at the base nearest the capital
+ *    - Uses worst-case (max-regret) scoring so it picks moves that protect the worst outcome
+ */
 export function runAITick(s: GameState) {
   const p = s.params;
+
+  // -------- SOUTH: attacker (Monte Carlo) --------
   if (s.time >= s.nextWaveAt) {
     s.waveNumber += 1;
     const waveSize = p.southWaveBase + Math.floor(Math.random() * 3) + Math.floor(s.waveNumber / 2);
     log(s, `=== South wave ${s.waveNumber} incoming (${waveSize} sorties) ===`, "south");
+    const plan = bestPlanFor(s, "south");
+    if (plan && plan.projectedScore > 0) applyPlan(s, plan);
     for (let i = 0; i < waveSize; i++) {
       const sug = bestMoveFor(s, "south");
       if (!sug) break;
@@ -149,13 +199,69 @@ export function runAITick(s: GameState) {
     s.southThinkAt = s.time + 4;
   } else if (s.time >= s.southThinkAt) {
     s.southThinkAt = s.time + p.southThinkInterval;
-    const sug = bestMoveFor(s, "south");
-    if (sug && sug.score > 30) sug.apply(s);
+    const plan = bestPlanFor(s, "south");
+    if (plan && plan.projectedScore > 10) {
+      applyPlan(s, plan);
+    } else {
+      const sug = bestMoveFor(s, "south");
+      if (sug && sug.score > 30) sug.apply(s);
+    }
   }
 
+  // -------- NORTH: defender (risk-minimizing) --------
   if (s.time >= s.northThinkAt) {
     s.northThinkAt = s.time + p.northThinkInterval;
-    const sug = bestMoveFor(s, "north");
-    if (sug && sug.score > 10) sug.apply(s);
+    runNorthDefender(s);
   }
+}
+
+function runNorthDefender(s: GameState) {
+  const myCities = s.cities.filter((c) => c.faction === "north" && c.hp > 0);
+  const capital = myCities.find((c) => c.isCapital);
+
+  const threatened = new Set<string>();
+  for (const f of s.flights) {
+    if (f.faction === "south" && (f.kind === "attack_base" || f.kind === "attack_city")) {
+      threatened.add(f.targetId);
+    }
+  }
+  const underAttack = threatened.size > 0;
+  const ranked = bestPlanFor(s, "north");
+
+  if (underAttack) {
+    if (ranked && ranked.kind === "fortify" && ranked.projectedScore > -5) {
+      applyPlan(s, ranked);
+      return;
+    }
+    const moves = allMovesFor(s, "north").filter((m) => m.kind === "transfer");
+    const top = moves[0];
+    if (top && top.score > 5) top.apply(s);
+    return;
+  }
+
+  // No active threat — keep capital guard healthy before any offense
+  if (capital) {
+    const myBases = s.bases.filter((b) => b.faction === "north" && b.hp > 0);
+    let guard = myBases[0];
+    let gd = guard ? dist(guard.pos, capital.pos) : Infinity;
+    for (const b of myBases) {
+      const d = dist(b.pos, capital.pos);
+      if (d < gd) { gd = d; guard = b; }
+    }
+    if (guard && guard.fighters < 4) {
+      const transfers = allMovesFor(s, "north").filter(
+        (m) => m.kind === "transfer" && m.targetId === guard.id,
+      );
+      const t = transfers[0];
+      if (t) { t.apply(s); return; }
+    }
+  }
+
+  // Counter-strike only when clearly favorable in worst-case
+  if (ranked && ranked.kind !== "fortify" && ranked.projectedScore > 15) {
+    applyPlan(s, ranked);
+    return;
+  }
+  const sug = bestMoveFor(s, "north");
+  if (sug && sug.kind !== "transfer" && sug.score > 25) sug.apply(s);
 }
