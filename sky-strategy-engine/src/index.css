@@ -1,0 +1,75 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Definition of the design system. All colors, gradients, fonts, etc should be defined here. 
+All colors MUST be HSL.
+*/
+
+@layer base {
+  :root {
+    /* Theater map palette */
+    --background: 215 35% 8%;
+    --foreground: 210 30% 92%;
+
+    --card: 215 30% 11%;
+    --card-foreground: 210 30% 92%;
+
+    --popover: 215 30% 11%;
+    --popover-foreground: 210 30% 92%;
+
+    --primary: 200 85% 60%;
+    --primary-foreground: 215 40% 8%;
+
+    --secondary: 215 25% 18%;
+    --secondary-foreground: 210 30% 92%;
+
+    --muted: 215 25% 16%;
+    --muted-foreground: 215 15% 60%;
+
+    --accent: 30 80% 55%;
+    --accent-foreground: 215 40% 8%;
+
+    --destructive: 0 75% 55%;
+    --destructive-foreground: 210 40% 98%;
+
+    --border: 215 25% 22%;
+    --input: 215 25% 22%;
+    --ring: 200 85% 60%;
+
+    --radius: 0.5rem;
+
+    /* Map terrain */
+    --terrain-north: 80 18% 22%;       /* olive land */
+    --terrain-south: 28 35% 22%;       /* brown land */
+    --terrain-sea: 215 55% 14%;        /* deep blue passage */
+    --terrain-island-north: 80 18% 18%;
+    --terrain-island-south: 28 35% 18%;
+
+    /* Faction */
+    --north: 200 85% 60%;              /* sky blue triangles */
+    --south: 18 90% 62%;               /* orange triangles */
+    --capital: 45 95% 55%;             /* yellow square */
+    --city: 0 0% 96%;                  /* white square */
+
+    /* Sidebar (kept default-ish) */
+    --sidebar-background: 215 30% 11%;
+    --sidebar-foreground: 210 30% 92%;
+    --sidebar-primary: 200 85% 60%;
+    --sidebar-primary-foreground: 215 40% 8%;
+    --sidebar-accent: 215 25% 18%;
+    --sidebar-accent-foreground: 210 30% 92%;
+    --sidebar-border: 215 25% 22%;
+    --sidebar-ring: 200 85% 60%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+  }
+}
