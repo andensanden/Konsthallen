@@ -1,6 +1,9 @@
+// ai.ts
+
 import { dist, fuelNeeded, launchFlight, log } from "./engine";
 import { AirBase, City, Faction, Flight, GameState } from "./types";
 import { applyPlan, bestPlanFor, rankedPlansFor } from "./strategy";
+import { NeuralNetwork } from "./ai_network"; 
 
 export type SuggestionKind = "transfer" | "attack_base" | "attack_city";
 
@@ -17,6 +20,66 @@ export interface Suggestion {
   bombers: number;
   apply: (s: GameState) => void;
 }
+
+// ============================================================
+// AI HJÄRNAN (Vår nya bedömare)
+// 8 inputs, 12 dolda noder, 3 outputs (poäng, andel fighters, andel bombers)
+// ============================================================
+const moveScorerAI = new NeuralNetwork(8, 12, 3);
+
+function scoreMoveWithAI(
+  s: GameState, 
+  base: AirBase, 
+  target: AirBase | City, 
+  kind: SuggestionKind,
+  targetThreat: number,
+  selfThreat: number
+): { score: number, fighterRatio: number, bomberRatio: number } {
+  
+  // 1. Normalisera all data
+  const normDist = dist(base.pos, target.pos) / s.params.maxFuel;
+  const normTargetThreat = Math.min(targetThreat / 20, 1.0);
+  const normSelfThreat = Math.min(selfThreat / 20, 1.0);
+  const normTargetValue = targetValue(target) / 100;
+  const normMyHp = base.hp / base.maxHp;
+  const bomberRatio = base.bombers / (base.fighters + base.bombers || 1);
+  
+  let targetDef = 0;
+  if ("fighters" in target) {
+    targetDef = Math.min((target as AirBase).fighters / 10, 1.0);
+  }
+
+  let actionCode = 0;
+  if (kind === "transfer") actionCode = 1.0;
+  else if (kind === "attack_base") actionCode = 0.5;
+  else if (kind === "attack_city") actionCode = 0.0;
+
+  // 2. Skapa input-arrayen
+  const inputs = [
+    normDist, 
+    normTargetThreat, 
+    normSelfThreat, 
+    normTargetValue, 
+    targetDef, 
+    actionCode,
+    normMyHp,
+    bomberRatio
+  ];
+
+  // 3. Fråga hjärnan vad den tycker
+  const output = moveScorerAI.predict(inputs);
+
+  // 4. Returnera objektet
+  // output[0] = poängen
+  // output[1] = andel fighters att skicka (begränsat till 0.0 - 1.0)
+  // output[2] = andel bombers att skicka (begränsat till 0.0 - 1.0)
+  return {
+    score: output[0] * 100,
+    fighterRatio: Math.min(Math.max(output[1], 0), 1),
+    bomberRatio: Math.min(Math.max(output[2], 0), 1)
+  };
+}
+
 
 function inFlightThreatTo(s: GameState, target: AirBase | City): number {
   let t = 0;
@@ -39,28 +102,36 @@ function reachable(s: GameState, from: AirBase, target: AirBase | City, roundTri
   return fuelNeeded(s, from.pos, target.pos, roundTrip) <= s.params.maxFuel;
 }
 
-/**
- * Enumerate all candidate moves for a faction, scored and sorted descending.
- */
 export function allMovesFor(s: GameState, faction: Faction): Suggestion[] {
   const myBases = s.bases.filter((b) => b.faction === faction && b.hp > 0);
   const enemyBases = s.bases.filter((b) => b.faction !== faction && b.hp > 0);
   const enemyCities = s.cities.filter((c) => c.faction !== faction && c.hp > 0);
-  const myCities = s.cities.filter((c) => c.faction === faction && c.hp > 0);
 
   const candidates: Suggestion[] = [];
 
   for (const base of myBases) {
-    // ---- Defensive transfers: if a friendly base/city is under heavy threat, send fighters
+    const selfThreat = inFlightThreatTo(s, base);
+
+    // ---- Defensive transfers ----
     for (const ally of [...s.bases.filter((b) => b.faction === faction && b.hp > 0 && b.id !== base.id)]) {
       const threat = inFlightThreatTo(s, ally);
       if (threat <= 0) continue;
       if (!reachable(s, base, ally, false)) continue;
-      const send = Math.min(base.fighters, Math.max(2, Math.ceil(threat / 3)));
+      
+      const aiDecision = scoreMoveWithAI(s, base, ally, "transfer", threat, selfThreat);
+      
+      // AI bestämmer hur många fighters som ska skickas
+      let send = Math.round(base.fighters * aiDecision.fighterRatio);
+      
+      // Vi lägger in en minimiregel för vettig spelmekanik
+      if (send === 0 && base.fighters > 0 && aiDecision.score > 20) {
+         send = 1; 
+      }
+
       if (send <= 0) continue;
-      const score = threat * 6 + targetValue(ally) * 0.4 - dist(base.pos, ally.pos) * 0.05;
+      
       candidates.push({
-        score,
+        score: aiDecision.score,
         faction,
         kind: "transfer",
         description: `Reinforce ${ally.name} from ${base.name} (${send}F)`,
@@ -78,22 +149,21 @@ export function allMovesFor(s: GameState, faction: Faction): Suggestion[] {
       });
     }
 
-    // ---- Offensive: attack enemy base with bombers + escort
+    // ---- Offensive: attack enemy base ----
     for (const eb of enemyBases) {
       if (!reachable(s, base, eb, true)) continue;
-      if (base.bombers <= 0 && base.fighters < 4) continue;
-      const useB = Math.min(base.bombers, 4);
-      const escort = Math.min(base.fighters, Math.max(2, useB + 1));
+      if (base.bombers <= 0 && base.fighters <= 0) continue;
+      
+      const aiDecision = scoreMoveWithAI(s, base, eb, "attack_base", 0, selfThreat);
+
+      // AI bestämmer upplägget
+      const useB = Math.round(base.bombers * aiDecision.bomberRatio);
+      const escort = Math.round(base.fighters * aiDecision.fighterRatio);
+
       if (useB + escort <= 0) continue;
-      // Don't strip a base that's itself threatened
-      const selfThreat = inFlightThreatTo(s, base);
-      const reserveOk = base.fighters - escort >= Math.ceil(selfThreat / 2);
-      if (!reserveOk) continue;
-      const value = targetValue(eb);
-      const enemyDef = eb.fighters * 4;
-      const score = value * 1.2 - enemyDef * 0.6 - dist(base.pos, eb.pos) * 0.04 + useB * 3;
+      
       candidates.push({
-        score,
+        score: aiDecision.score,
         faction,
         kind: "attack_base",
         description: `Strike ${eb.name} from ${base.name} (${escort}F + ${useB}B)`,
@@ -111,19 +181,21 @@ export function allMovesFor(s: GameState, faction: Faction): Suggestion[] {
       });
     }
 
-    // ---- Offensive: bomb enemy city
+    // ---- Offensive: bomb enemy city ----
     for (const ec of enemyCities) {
       if (!reachable(s, base, ec, true)) continue;
-      const useB = Math.min(base.bombers, ec.isCapital ? 5 : 3);
-      const escort = Math.min(base.fighters, Math.max(1, useB));
-      if (useB <= 0) continue;
-      const selfThreat = inFlightThreatTo(s, base);
-      const reserveOk = base.fighters - escort >= Math.ceil(selfThreat / 2);
-      if (!reserveOk) continue;
-      const value = targetValue(ec);
-      const score = value * 1.4 - dist(base.pos, ec.pos) * 0.05 + useB * 2.5;
+      if (base.bombers <= 0) continue; 
+      
+      const aiDecision = scoreMoveWithAI(s, base, ec, "attack_city", 0, selfThreat);
+
+      // AI bestämmer upplägget
+      const useB = Math.round(base.bombers * aiDecision.bomberRatio);
+      const escort = Math.round(base.fighters * aiDecision.fighterRatio);
+
+      if (useB <= 0) continue; // Måste ha bombplan för att bomba en stad
+      
       candidates.push({
-        score,
+        score: aiDecision.score,
         faction,
         kind: "attack_city",
         description: `Raid ${ec.name} from ${base.name} (${escort}F + ${useB}B)`,
@@ -142,48 +214,18 @@ export function allMovesFor(s: GameState, faction: Faction): Suggestion[] {
     }
   }
 
-  // Defensive consideration: if my own city is under heavy threat and we have no plan, prioritize transfer of fighters to nearest friendly base near it.
-  for (const city of myCities) {
-    const threat = inFlightThreatTo(s, city);
-    if (threat <= 0) continue;
-    // boost any transfer suggestion landing at the base nearest this city
-    let nearest = myBases[0];
-    let nd = nearest ? dist(nearest.pos, city.pos) : Infinity;
-    for (const b of myBases) {
-      const d = dist(b.pos, city.pos);
-      if (d < nd) { nd = d; nearest = b; }
-    }
-    if (!nearest) continue;
-    for (const c of candidates) {
-      if (c.description.includes(nearest.name)) c.score += threat * 4;
-    }
-  }
-
   candidates.sort((a, b) => b.score - a.score);
   return candidates;
 }
 
-/** Best single suggestion for a faction (top of allMovesFor). */
 export function bestMoveFor(s: GameState, faction: Faction): Suggestion | null {
   return allMovesFor(s, faction)[0] ?? null;
 }
 
-/**
- * Run AI cadence — two distinct AIs.
- *
- *  SOUTH (attacker): Monte Carlo rollout planner.
- *    - Launches scheduled waves with the best multi-base coordinated plan
- *    - Between waves, opportunistically presses if mean rollout shows clear gain
- *
- *  NORTH (defender): Risk-minimizing reactive defender.
- *    - Reinforces threatened bases first; counter-strikes only when safe
- *    - Always keeps a fighter reserve at the base nearest the capital
- *    - Uses worst-case (max-regret) scoring so it picks moves that protect the worst outcome
- */
+// ... resten av runAITick och runNorthDefender stannar oförändrade! ...
 export function runAITick(s: GameState) {
   const p = s.params;
 
-  // -------- SOUTH: attacker (Monte Carlo) --------
   if (s.time >= s.nextWaveAt) {
     s.waveNumber += 1;
     const waveSize = p.southWaveBase + Math.floor(Math.random() * 3) + Math.floor(s.waveNumber / 2);
@@ -208,7 +250,6 @@ export function runAITick(s: GameState) {
     }
   }
 
-  // -------- NORTH: defender (risk-minimizing) --------
   if (s.time >= s.northThinkAt) {
     s.northThinkAt = s.time + p.northThinkInterval;
     runNorthDefender(s);
@@ -239,7 +280,6 @@ function runNorthDefender(s: GameState) {
     return;
   }
 
-  // No active threat — keep capital guard healthy before any offense
   if (capital) {
     const myBases = s.bases.filter((b) => b.faction === "north" && b.hp > 0);
     let guard = myBases[0];
@@ -257,7 +297,6 @@ function runNorthDefender(s: GameState) {
     }
   }
 
-  // Counter-strike only when clearly favorable in worst-case
   if (ranked && ranked.kind !== "fortify" && ranked.projectedScore > 15) {
     applyPlan(s, ranked);
     return;
