@@ -1,36 +1,44 @@
-import { GameState } from "@/game/types"; // Se till att sökvägen stämmer
+import { GameState } from "@/game/types";
 
 interface Props {
   state: GameState;
   hoverId: string | null;
   onHover: (id: string | null) => void;
+  selectedAaId?: string | null;
+  onSelectAa?: (id: string | null) => void;
+  onMapClick?: (pos: { x: number; y: number }) => void;
 }
 
 const VB_W = 1000;
 const VB_H = 780;
 
-export function GameMap({ state, hoverId, onHover }: Props) {
+export function GameMap({ state, hoverId, onHover, selectedAaId, onSelectAa, onMapClick }: Props) {
+  const handleSvgClick = (e: React.MouseEvent<SVGSVGElement>) => {
+    if (!onMapClick) return;
+    const svg = e.currentTarget;
+    const pt = svg.createSVGPoint();
+    pt.x = e.clientX;
+    pt.y = e.clientY;
+    const ctm = svg.getScreenCTM();
+    if (!ctm) return;
+    const local = pt.matrixTransform(ctm.inverse());
+    onMapClick({ x: local.x, y: local.y });
+  };
   return (
     <svg
       viewBox={`0 0 ${VB_W} ${VB_H}`}
       className="w-full h-full block select-none"
       role="img"
       aria-label="Boreal Passage theater map"
+      onClick={handleSvgClick}
     >
-      <defs>
-        <pattern id="grid" width="50" height="50" patternUnits="userSpaceOnUse">
-          <path
-            d="M 50 0 L 0 0 0 50"
-            fill="none"
-            stroke="hsl(var(--border) / 0.25)"
-            strokeWidth="0.5"
-          />
-        </pattern>
-      </defs>
+      
 
-      {/* Background sea and grid */}
+      {/* Background sea */}
+      <rect x="0" y="0" width={VB_W} height={VB_H} fill="hsl(var(--terrain-sea))" />
+        {/* Background sea and grid
       <rect width={VB_W} height={VB_H} fill="hsl(var(--terrain-sea))" />
-      <rect width={VB_W} height={VB_H} fill="url(#grid)" />
+      <rect width={VB_W} height={VB_H} fill="url(#grid)" /> */}
 
       {/* ===================== NORTH TERRAIN ===================== */}
       <g id="north-group" transform="translate(0,-40)">
@@ -150,26 +158,61 @@ export function GameMap({ state, hoverId, onHover }: Props) {
       <text x={VB_W - 40} y={VB_H - 6} className="fill-foreground/20" style={{ fontSize: 9 }}>1000,780</text>
 
 
-      {/* ===================== DYNAMIC INTERACTIVE REACT STATE ===================== */}
-      
+
       {/* Flight paths */}
-      {state.flights.map((f) => (
-        <line
-          key={`p${f.id}`}
-          x1={f.origin.x}
-          y1={f.origin.y}
-          x2={f.dest.x}
-          y2={f.dest.y}
-          stroke={f.faction === "north" ? "hsl(var(--north))" : "hsl(var(--south))"}
-          strokeOpacity={0.35}
-          strokeDasharray="4 6"
-          strokeWidth={1.2}
-        />
-      ))}
+      {state.flights.map((f) => {
+        const isMissile = f.kind === "missile_strike";
+        return (
+          <line
+            key={`p${f.id}`}
+            x1={f.origin.x}
+            y1={f.origin.y}
+            x2={f.dest.x}
+            y2={f.dest.y}
+            stroke={f.faction === "north" ? "hsl(var(--north))" : "hsl(var(--south))"}
+            strokeOpacity={isMissile ? 0.55 : 0.35}
+            strokeDasharray={isMissile ? "2 3" : "4 6"}
+            strokeWidth={isMissile ? 0.9 : 1.2}
+          />
+        );
+      })}
+
+      {/* AA range circles + units (rendered before bases so labels overlay) */}
+      {state.aaUnits.filter((a) => a.hp > 0).map((a) => {
+        const color = a.faction === "north" ? "hsl(var(--north))" : "hsl(var(--south))";
+        const isSel = selectedAaId === a.id;
+        return (
+          <g key={a.id}>
+            <circle cx={a.pos.x} cy={a.pos.y} r={a.range} fill={color} fillOpacity={isSel ? 0.1 : 0.04} stroke={color} strokeOpacity={isSel ? 0.5 : 0.18} strokeDasharray="3 4" strokeWidth={isSel ? 1.4 : 0.8} />
+            {a.dest && (
+              <line x1={a.pos.x} y1={a.pos.y} x2={a.dest.x} y2={a.dest.y} stroke={color} strokeOpacity={0.4} strokeDasharray="2 3" strokeWidth={0.8} />
+            )}
+            {isSel && (
+              <circle cx={a.pos.x} cy={a.pos.y} r={11} fill="none" stroke="hsl(var(--foreground))" strokeWidth={1.2} />
+            )}
+            <rect
+              x={a.pos.x - 5}
+              y={a.pos.y - 5}
+              width={10}
+              height={10}
+              fill={color}
+              stroke={isSel ? "hsl(var(--foreground))" : "hsl(var(--background))"}
+              strokeWidth={isSel ? 1.5 : 1}
+              transform={`rotate(45 ${a.pos.x} ${a.pos.y})`}
+              style={{ cursor: onSelectAa ? "pointer" : undefined }}
+              onClick={(e) => {
+                if (!onSelectAa) return;
+                e.stopPropagation();
+                onSelectAa(isSel ? null : a.id);
+              }}
+            />
+          </g>
+        );
+      })}
 
       {/* Cities */}
       {state.cities.map((c) => {
-        const size = c.isCapital ? 20 : 14;
+        const size = c.isCapital ? 22 : 14;
         const fill = c.isCapital ? "hsl(var(--capital))" : "hsl(var(--city))";
         const dim = c.hp <= 0 ? 0.25 : 1;
         return (
@@ -237,7 +280,7 @@ export function GameMap({ state, hoverId, onHover }: Props) {
               className="fill-foreground"
               style={{ fontSize: 10 }}
             >
-              {b.fighters}F · {b.bombers}B
+              {b.fighters}F · {b.bombers}B · {b.missiles}M
             </text>
           </g>
         );
@@ -246,21 +289,30 @@ export function GameMap({ state, hoverId, onHover }: Props) {
       {/* Flights */}
       {state.flights.map((f) => {
         const color = f.faction === "north" ? "hsl(var(--north))" : "hsl(var(--south))";
-        const angle = (Math.atan2(f.dest.y - f.origin.y, f.dest.x - f.origin.x) * 180) / Math.PI;
+        const angle =
+          (Math.atan2(f.dest.y - f.origin.y, f.dest.x - f.origin.x) * 180) / Math.PI;
+        const isMissile = f.kind === "missile_strike";
         return (
           <g key={f.id} transform={`translate(${f.pos.x} ${f.pos.y}) rotate(${angle})`}>
-            <path
-              d="M -6,-4 L 8,0 L -6,4 L -3,0 Z"
-              fill={color}
-              stroke="hsl(var(--background))"
-              strokeWidth={0.5}
-            />
+            {isMissile ? (
+              <path d="M -5,-1.5 L 6,0 L -5,1.5 Z" fill={color} stroke="hsl(var(--background))" strokeWidth={0.4} />
+            ) : (
+              <path d="M -6,-4 L 8,0 L -6,4 L -3,0 Z" fill={color} stroke="hsl(var(--background))" strokeWidth={0.5} />
+            )}
             <text x={10} y={-6} className="fill-foreground" style={{ fontSize: 8 }}>
-              {f.fighters}/{f.bombers}
+              {isMissile ? `${f.missiles}M` : `${f.fighters}/${f.bombers}`}
             </text>
           </g>
         );
       })}
+
+      {/* Scale bar */}
+      <g transform={`translate(${VB_W - 180} ${VB_H - 30})`}>
+        <line x1="0" y1="0" x2="120" y2="0" stroke="hsl(var(--foreground))" strokeWidth="2" />
+        <line x1="0" y1="-4" x2="0" y2="4" stroke="hsl(var(--foreground))" strokeWidth="2" />
+        <line x1="120" y1="-4" x2="120" y2="4" stroke="hsl(var(--foreground))" strokeWidth="2" />
+        <text x="130" y="4" className="fill-muted-foreground" style={{ fontSize: 11 }}>200 km</text>
+      </g>
     </svg>
   );
 }

@@ -1,4 +1,4 @@
-import { AirBase, City, Flight, GameState, Vec2 } from "./types";
+import { AAUnit, AirBase, City, Faction, Flight, GameState, MissionKind, Vec2 } from "./types";
 
 export function dist(a: Vec2, b: Vec2): number {
   const dx = a.x - b.x;
@@ -26,23 +26,64 @@ export function fuelNeeded(s: GameState, from: Vec2, to: Vec2, roundTrip: boolea
   return roundTrip ? d * 2 + 80 : d + 50;
 }
 
+// ---------------- Land mask -----------------
+// Coarse polygon match to GameMap landmasses. Used to constrain AA movement.
+const NORTH_LAND_MAX_Y = 360;     // approximate south edge of north mainland
+const SOUTH_LAND_MIN_Y = 510;     // approximate north edge of south mainland
+const MAP_W = 1000;
+const MAP_H = 780;
+
+export function isInOwnLand(faction: Faction, pos: Vec2, coastBand: number = 0): boolean {
+  if (pos.x < -coastBand || pos.x > MAP_W + coastBand || pos.y < -coastBand || pos.y > MAP_H + coastBand) return false;
+  // Allow up to `coastBand` map units past the friendly coastline into the sea
+  // so AA can deploy along the shore but not cross to the other side.
+  if (faction === "north") return pos.y <= NORTH_LAND_MAX_Y + coastBand;
+  return pos.y >= SOUTH_LAND_MIN_Y - coastBand;
+}
+
+// ---------------- Economy -----------------
+
+export function unitOpsCost(s: GameState, fighters: number, bombers: number, distance: number, roundTrip: boolean): number {
+  const seconds = (distance * (roundTrip ? 2 : 1)) / Math.max(1, s.params.flightSpeed);
+  return seconds * (fighters * s.params.costs.fighterOpsPerSec + bombers * s.params.costs.bomberOpsPerSec);
+}
+
+export function tickIncome(s: GameState, dt: number) {
+  for (const faction of ["north", "south"] as const) {
+    let inc = 0;
+    for (const b of s.bases) if (b.faction === faction && b.hp > 0) inc += s.params.baseIncomePerSec;
+    for (const c of s.cities) {
+      if (c.faction !== faction || c.hp <= 0) continue;
+      inc += c.isCapital ? s.params.capitalIncomePerSec : s.params.cityIncomePerSec;
+    }
+    s.credits[faction] += inc * dt;
+  }
+}
+
+// ---------------- Launching ----------------
+
 export function launchFlight(
   s: GameState,
   base: AirBase,
   target: AirBase | City,
-  kind: Flight["kind"],
+  kind: MissionKind,
   fighters: number,
   bombers: number,
 ): Flight | null {
+  if (kind === "missile_strike") return null; // use launchMissile
   if (fighters > base.fighters || bombers > base.bombers) return null;
   if (fighters + bombers <= 0) return null;
   const required = fuelNeeded(s, base.pos, target.pos, kind !== "transfer");
   if (required > s.params.maxFuel) return null;
 
+  // Operating cost (deducted at launch). Allow negative credits — debt is just a soft signal.
+  const d = dist(base.pos, target.pos);
+  const ops = unitOpsCost(s, fighters, bombers, d, kind !== "transfer");
+  s.credits[base.faction] -= ops;
+
   base.fighters -= fighters;
   base.bombers -= bombers;
 
-  const d = dist(base.pos, target.pos);
   const f: Flight = {
     id: `f${Math.random().toString(36).slice(2, 9)}`,
     faction: base.faction,
@@ -51,6 +92,7 @@ export function launchFlight(
     kind,
     fighters,
     bombers,
+    missiles: 0,
     pos: { ...base.pos },
     origin: { ...base.pos },
     dest: { ...target.pos },
@@ -63,11 +105,100 @@ export function launchFlight(
   const targetName = (target as { name?: string }).name ?? (target as { id: string }).id;
   log(
     s,
-    `${base.name} → ${targetName}: ${kind.replace("_", " ")} (${fighters}F / ${bombers}B)`,
+    `${base.name} → ${targetName}: ${kind.replace("_", " ")} (${fighters}F / ${bombers}B) · -${ops.toFixed(0)}cr`,
     base.faction,
   );
   return f;
 }
+
+export function launchMissile(
+  s: GameState,
+  base: AirBase,
+  target: AirBase | City,
+  count: number,
+): Flight | null {
+  if (count <= 0 || base.missiles < count) return null;
+  // Missiles: one-way only with their own short range cap.
+  const required = fuelNeeded(s, base.pos, target.pos, false);
+  if (required > s.params.missileMaxFuel) return null;
+
+  base.missiles -= count;
+  const d = dist(base.pos, target.pos);
+  const f: Flight = {
+    id: `m${Math.random().toString(36).slice(2, 9)}`,
+    faction: base.faction,
+    fromId: base.id,
+    targetId: target.id,
+    kind: "missile_strike",
+    fighters: 0,
+    bombers: 0,
+    missiles: count,
+    pos: { ...base.pos },
+    origin: { ...base.pos },
+    dest: { ...target.pos },
+    fuel: s.params.missileMaxFuel,
+    speed: s.params.flightSpeed * s.params.missileSpeedMult,
+    progress: 0,
+    totalDist: d,
+  };
+  s.flights.push(f);
+  const targetName = (target as { name?: string }).name ?? (target as { id: string }).id;
+  log(s, `${base.name} launches ${count}× missile → ${targetName}`, base.faction);
+  return f;
+}
+
+// ---------------- Purchasing ----------------
+
+export type PurchaseKind = "fighter" | "bomber" | "missile" | "aa";
+
+export function purchaseUnit(s: GameState, faction: Faction, kind: PurchaseKind, baseId?: string): boolean {
+  const c = s.params.costs;
+  const price = kind === "fighter" ? c.fighter : kind === "bomber" ? c.bomber : kind === "missile" ? c.missile : c.aa;
+  if (s.credits[faction] < price) return false;
+
+  if (kind === "aa") {
+    // Spawn at faction's most-threatened owned base (or a default position)
+    const bases = s.bases.filter((b) => b.faction === faction && b.hp > 0);
+    if (bases.length === 0) return false;
+    const home = bases[Math.floor(Math.random() * bases.length)];
+    s.credits[faction] -= price;
+    s.aaUnits.push({
+      id: `aa${Math.random().toString(36).slice(2, 9)}`,
+      faction,
+      pos: { ...home.pos },
+      dest: null,
+      hp: s.params.aaHp,
+      maxHp: s.params.aaHp,
+      range: s.params.aaRange,
+      speed: s.params.aaSpeed,
+      fireCooldown: 0,
+    });
+    log(s, `New AA battery deployed near ${home.name} (-${price}cr)`, faction);
+    return true;
+  }
+
+  // Aircraft / missile go to a base
+  let base: AirBase | undefined;
+  if (baseId) base = s.bases.find((b) => b.id === baseId && b.faction === faction && b.hp > 0);
+  if (!base) {
+    const bases = s.bases.filter((b) => b.faction === faction && b.hp > 0);
+    if (bases.length === 0) return false;
+    // Prefer base with lowest count of that unit
+    base = bases.reduce((best, b) => {
+      const v = (kind === "fighter" ? b.fighters : kind === "bomber" ? b.bombers : b.missiles);
+      const vb = (kind === "fighter" ? best.fighters : kind === "bomber" ? best.bombers : best.missiles);
+      return v < vb ? b : best;
+    });
+  }
+  s.credits[faction] -= price;
+  if (kind === "fighter") base.fighters += 1;
+  else if (kind === "bomber") base.bombers += 1;
+  else base.missiles += 1;
+  log(s, `Built 1× ${kind} at ${base.name} (-${price}cr)`, faction);
+  return true;
+}
+
+// ---------------- Combat (mid-air) ----------------
 
 function returnHome(s: GameState, f: Flight) {
   const friendly = s.bases.filter((b) => b.faction === f.faction && b.hp > 0);
@@ -93,7 +224,6 @@ function returnHome(s: GameState, f: Flight) {
   f.progress = 0;
 }
 
-/** Air-to-air encounter between two flights (interception en route). */
 function midairCombat(s: GameState, defender: Flight, attacker: Flight) {
   const p = s.params;
   const dF = defender.fighters;
@@ -104,7 +234,6 @@ function midairCombat(s: GameState, defender: Flight, attacker: Flight) {
   attacker.fighters = Math.max(0, aF - aLost);
   defender.fighters = Math.max(0, dF - dLost);
 
-  // Surviving defender fighters savage bombers
   const bombKill = Math.min(defender.fighters, attacker.bombers);
   const bombersDown = Math.round(bombKill * 0.7);
   attacker.bombers = Math.max(0, attacker.bombers - bombersDown);
@@ -114,22 +243,18 @@ function midairCombat(s: GameState, defender: Flight, attacker: Flight) {
     `Intercept! ${defender.fighters + dLost}F vs ${aF}F/${attacker.bombers + bombersDown}B → atk -${aLost}F/-${bombersDown}B, def -${dLost}F.`,
     defender.faction,
   );
-
-  // Defender returns home regardless
   returnHome(s, defender);
 }
 
-/** When an enemy flight crosses near a base, that base may scramble interceptors. */
 function tryScrambleIntercept(s: GameState, attacker: Flight) {
-  if (attacker.kind === "transfer") return; // don't intercept ferries
+  if (attacker.kind === "transfer" || attacker.kind === "missile_strike") return;
   const p = s.params;
   const candidates = s.bases.filter(
     (b) => b.faction !== attacker.faction && b.hp > 0 && b.fighters > 0
       && dist(b.pos, attacker.pos) <= p.interceptRange
-      && !s.flights.some((x) => x.fromId === b.id && x.targetId === attacker.id), // not already intercepting
+      && !s.flights.some((x) => x.fromId === b.id && x.targetId === attacker.id),
   );
   if (candidates.length === 0) return;
-  // Pick base with most fighters
   candidates.sort((a, b) => b.fighters - a.fighters);
   const base = candidates[0];
   const send = Math.max(1, Math.floor(base.fighters * p.interceptScrambleFraction));
@@ -139,20 +264,76 @@ function tryScrambleIntercept(s: GameState, attacker: Flight) {
     faction: base.faction,
     fromId: base.id,
     targetId: attacker.id,
-    kind: "attack_base", // marker; resolved as midair on arrival
+    kind: "attack_base",
     fighters: send,
     bombers: 0,
+    missiles: 0,
     pos: { ...base.pos },
     origin: { ...base.pos },
     dest: { ...attacker.pos },
     fuel: p.maxFuel,
-    speed: p.flightSpeed * 1.15, // interceptors faster
+    speed: p.flightSpeed * 1.15,
     progress: 0,
     totalDist: dist(base.pos, attacker.pos),
   };
   s.flights.push(interceptor);
   log(s, `${base.name} scrambles ${send}F to intercept!`, base.faction);
 }
+
+// ---------------- AA logic ----------------
+
+function tickAA(s: GameState, dt: number) {
+  const p = s.params;
+  for (const aa of s.aaUnits) {
+    if (aa.hp <= 0) continue;
+
+    // Movement on own land
+    if (aa.dest) {
+      const d = dist(aa.pos, aa.dest);
+      if (d < 2) {
+        aa.dest = null;
+      } else {
+        const step = aa.speed * dt;
+        const nx = aa.pos.x + ((aa.dest.x - aa.pos.x) / d) * Math.min(step, d);
+        const ny = aa.pos.y + ((aa.dest.y - aa.pos.y) / d) * Math.min(step, d);
+        // Clamp: only move if intermediate point is in own territory (forbids crossing sea)
+        if (isInOwnLand(aa.faction, { x: nx, y: ny }, p.aaCoastBand)) {
+          aa.pos = { x: nx, y: ny };
+        } else {
+          aa.dest = null; // abort if would leave territory
+        }
+      }
+    }
+
+    // Firing
+    aa.fireCooldown = Math.max(0, aa.fireCooldown - dt);
+    if (aa.fireCooldown > 0) continue;
+    // Pick best target in range: enemy flight with most fighters+bombers (missiles ignored per design)
+    let best: Flight | null = null;
+    let bestVal = 0;
+    for (const f of s.flights) {
+      if (f.faction === aa.faction) continue;
+      if (f.kind === "missile_strike") continue; // AA cannot intercept missiles
+      const tot = f.fighters + f.bombers;
+      if (tot <= 0) continue;
+      if (dist(aa.pos, f.pos) > aa.range) continue;
+      const v = f.bombers * 2 + f.fighters;
+      if (v > bestVal) { bestVal = v; best = f; }
+    }
+    if (!best) continue;
+    // Apply damage probabilistically
+    const dmg = p.aaDmgPerShot;
+    if (best.bombers > 0 && Math.random() < 0.5) {
+      best.bombers = Math.max(0, best.bombers - Math.ceil(dmg));
+    } else if (best.fighters > 0) {
+      best.fighters = Math.max(0, best.fighters - Math.ceil(dmg));
+    }
+    aa.fireCooldown = p.aaFireInterval;
+    log(s, `AA battery engages ${best.faction === "north" ? "N" : "S"} flight (-${Math.ceil(dmg)} unit).`, aa.faction);
+  }
+}
+
+// ---------------- Combat resolution at target ----------------
 
 function resolveCombatAtBase(s: GameState, f: Flight, base: AirBase) {
   const p = s.params;
@@ -185,6 +366,7 @@ function resolveCombatAtBase(s: GameState, f: Flight, base: AirBase) {
     log(s, `${base.name} destroyed!`, f.faction);
     base.fighters = 0;
     base.bombers = 0;
+    base.missiles = 0;
   }
 }
 
@@ -199,6 +381,13 @@ function resolveCombatAtCity(s: GameState, f: Flight, city: City) {
   if (city.hp <= 0) log(s, `${city.name} fallen!`, f.faction);
 }
 
+function resolveMissileImpact(s: GameState, f: Flight, target: AirBase | City) {
+  const dmg = f.missiles * s.params.missileDmg;
+  target.hp = Math.max(0, target.hp - dmg);
+  log(s, `Missile impact on ${target.name}: -${dmg} HP (${Math.round(target.hp)}/${target.maxHp}).`, f.faction);
+  if (target.hp <= 0) log(s, `${target.name} destroyed by missile strike!`, f.faction);
+}
+
 function landTransfer(s: GameState, f: Flight, base: AirBase) {
   if (base.faction !== f.faction || base.hp <= 0) {
     log(s, `Transfer aborted — destination ${base.name} not viable.`, f.faction);
@@ -209,13 +398,17 @@ function landTransfer(s: GameState, f: Flight, base: AirBase) {
   log(s, `${f.fighters}F/${f.bombers}B landed at ${base.name}.`, f.faction);
 }
 
+// ---------------- Main tick ----------------
+
 export function tick(s: GameState, dt: number) {
   if (s.paused || s.winner) return;
   const adt = dt * s.speed;
   s.time += adt;
   const p = s.params;
 
-  // Move flights
+  tickIncome(s, adt);
+  tickAA(s, adt);
+
   for (const f of [...s.flights]) {
     const stepDist = f.speed * adt;
     f.fuel -= stepDist;
@@ -226,16 +419,18 @@ export function tick(s: GameState, dt: number) {
       y: f.origin.y + (f.dest.y - f.origin.y) * f.progress,
     };
 
-    // Interceptors target moving flights — keep updating destination
+    // Interceptors target moving flights — keep updating destination.
+    // Skip if target is a missile (cannot be intercepted by fighters).
     const targetFlight = s.flights.find((x) => x.id === f.targetId);
-    if (targetFlight && f.fighters > 0 && f.bombers === 0 && f.faction !== targetFlight.faction) {
+    if (
+      targetFlight && targetFlight.kind !== "missile_strike" &&
+      f.fighters > 0 && f.bombers === 0 && f.faction !== targetFlight.faction
+    ) {
       f.dest = { ...targetFlight.pos };
       f.totalDist = Math.max(1, dist(f.origin, f.dest));
-      // Check rendezvous
       if (dist(f.pos, targetFlight.pos) < 18) {
         s.flights = s.flights.filter((x) => x !== f);
         midairCombat(s, f, targetFlight);
-        // If the target attacker was wiped out, remove it (and its path) from the map
         if (targetFlight.fighters + targetFlight.bombers <= 0) {
           s.flights = s.flights.filter((x) => x !== targetFlight);
           log(s, `Attacking flight wiped out mid-air.`, targetFlight.faction);
@@ -244,8 +439,12 @@ export function tick(s: GameState, dt: number) {
       }
     }
 
-    // Any flight that has lost all aircraft is removed (no ghost paths)
-    if (f.fighters + f.bombers <= 0) {
+    // Remove flights with no payload
+    if (f.kind !== "missile_strike" && f.fighters + f.bombers <= 0) {
+      s.flights = s.flights.filter((x) => x !== f);
+      continue;
+    }
+    if (f.kind === "missile_strike" && f.missiles <= 0) {
       s.flights = s.flights.filter((x) => x !== f);
       continue;
     }
@@ -256,6 +455,8 @@ export function tick(s: GameState, dt: number) {
       if (!target) continue;
       if (f.kind === "transfer") {
         if ("fighters" in target) landTransfer(s, f, target);
+      } else if (f.kind === "missile_strike") {
+        resolveMissileImpact(s, f, target);
       } else if (f.kind === "attack_base" && "fighters" in target) {
         resolveCombatAtBase(s, f, target);
         if (f.fighters + f.bombers > 0) {
@@ -275,14 +476,13 @@ export function tick(s: GameState, dt: number) {
     }
   }
 
-  // Scramble interceptors against attacking flights crossing defended airspace
+  // Scramble interceptors
   for (const f of [...s.flights]) {
-    if (f.kind === "transfer") continue;
-    // only intercept enemy flights heading to friendly assets
+    if (f.kind === "transfer" || f.kind === "missile_strike") continue;
     tryScrambleIntercept(s, f);
   }
 
-  // Production
+  // Production (passive base churn — independent of credits)
   if (s.time - s.lastProduceAt >= p.productionInterval) {
     s.lastProduceAt = s.time;
     for (const b of s.bases) {
@@ -293,7 +493,7 @@ export function tick(s: GameState, dt: number) {
     }
   }
 
-  // Win condition: a side loses only when ALL its cities AND ALL its bases are eliminated
+  // Win condition
   const northAlive = s.cities.some((c) => c.faction === "north" && c.hp > 0)
                   || s.bases.some((b) => b.faction === "north" && b.hp > 0);
   const southAlive = s.cities.some((c) => c.faction === "south" && c.hp > 0)
