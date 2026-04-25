@@ -2,7 +2,7 @@ import { GameState, City, AirBase, SimParams, AAUnit } from "./types";
 
 export const DEFAULT_PARAMS: SimParams = {
   flightSpeed: 90,
-  maxFuel: 1400,
+  maxFuel: 1900,
   fighterVsFighter: 0.55,
   bomberDmg: 14,
   fighterStrafeDmg: 4,

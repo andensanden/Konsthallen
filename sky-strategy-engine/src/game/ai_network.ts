@@ -13,12 +13,11 @@ export class NeuralNetwork {
     this.hiddenSize = hiddenSize;
     this.outputSize = outputSize;
 
-    // Skapar slumpmässiga vikter (en "dum" AI från start)
+    // Skapar slumpmässiga vikter mellan -1 och 1
     this.weightsInputHidden = this.randomizeMatrix(inputSize, hiddenSize);
     this.weightsHiddenOutput = this.randomizeMatrix(hiddenSize, outputSize);
   }
 
-  // Tar in situationen (mellan 0.0 och 1.0) och spottar ut beslutet
   public predict(inputs: number[]): number[] {
     if (inputs.length !== this.inputSize) {
       throw new Error(`Expected ${this.inputSize} inputs, got ${inputs.length}`);
@@ -36,8 +35,7 @@ export class NeuralNetwork {
       for (let j = 0; j < inputs.length; j++) {
         sum += inputs[j] * weights[j][i];
       }
-      // ReLU aktiveringsfunktion (tar bort negativa tal)
-      outputs[i] = Math.max(0, sum);
+      outputs[i] = Math.max(0, sum); // ReLU
     }
     return outputs;
   }
@@ -48,9 +46,6 @@ export class NeuralNetwork {
     );
   }
 
-  // ==========================================
-  // Dessa används senare när du ska träna AI:n
-  // ==========================================
   public getWeights(): { ih: number[][], ho: number[][] } {
     return {
       ih: JSON.parse(JSON.stringify(this.weightsInputHidden)),
