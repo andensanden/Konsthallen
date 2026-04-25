@@ -12,8 +12,21 @@ import { allMovesFor, runAITick, Suggestion } from "@/game/ai";
 import { applyPlan, CoordinatedPlan, rankedPlansFor } from "@/game/strategy";
 import { AdvisorPanel } from "@/components/AdvisorPanel";
 import { ManualOrderPanel } from "@/components/ManualOrderPanel";
-import { launchFlight, findBase, findTarget } from "@/game/engine";
+import { AAControlPanel } from "@/components/AAControlPanel";
+import { launchFlight, launchMissile, findBase, findTarget, isInOwnLand } from "@/game/engine";
 import { MissionKind } from "@/game/types";
+
+function cloneGameState(s: GameState): GameState {
+  return {
+    ...s,
+    cities: s.cities.map((c) => ({ ...c })),
+    bases: s.bases.map((b) => ({ ...b })),
+    flights: s.flights.map((f) => ({ ...f, pos: { ...f.pos }, origin: { ...f.origin }, dest: { ...f.dest } })),
+    aaUnits: s.aaUnits.map((a) => ({ ...a, pos: { ...a.pos }, dest: a.dest ? { ...a.dest } : null })),
+    credits: { ...s.credits },
+    log: [...s.log],
+  };
+}
 import { Pause, Play, RotateCcw, Gauge, Sliders } from "lucide-react";
 
 const Index = () => {
@@ -21,6 +34,7 @@ const Index = () => {
   const [state, setState] = useState<GameState>(() => createInitialState(DEFAULT_PARAMS));
   const [hoverId, setHoverId] = useState<string | null>(null);
   const [showParams, setShowParams] = useState(true);
+  const [selectedAaId, setSelectedAaId] = useState<string | null>(null);
   const stateRef = useRef(state);
   stateRef.current = state;
 
@@ -48,14 +62,13 @@ const Index = () => {
       const dt = Math.min(0.1, (now - last) / 1000);
       last = now;
       const s = { ...stateRef.current };
-      // mutate clone (deep enough for our arrays — but engine mutates references)
-      // Since engine mutates objects, we need a true mutable copy for React to re-render
-      // We'll deep-clone the parts that mutate.
       const cloned: GameState = {
         ...s,
         cities: s.cities.map((c) => ({ ...c })),
         bases: s.bases.map((b) => ({ ...b })),
         flights: s.flights.map((f) => ({ ...f, pos: { ...f.pos }, origin: { ...f.origin }, dest: { ...f.dest } })),
+        aaUnits: s.aaUnits.map((a) => ({ ...a, pos: { ...a.pos }, dest: a.dest ? { ...a.dest } : null })),
+        credits: { ...s.credits },
         log: [...s.log],
       };
       tick(cloned, dt);
@@ -82,13 +95,7 @@ const Index = () => {
 
   const executeSuggestion = (sug: Suggestion) => {
     setState((s) => {
-      const cloned: GameState = {
-        ...s,
-        cities: s.cities.map((c) => ({ ...c })),
-        bases: s.bases.map((b) => ({ ...b })),
-        flights: s.flights.map((f) => ({ ...f, pos: { ...f.pos }, origin: { ...f.origin }, dest: { ...f.dest } })),
-        log: [...s.log],
-      };
+      const cloned = cloneGameState(s);
       sug.apply(cloned);
       stateRef.current = cloned;
       return cloned;
@@ -97,13 +104,7 @@ const Index = () => {
 
   const executePlan = (plan: CoordinatedPlan) => {
     setState((s) => {
-      const cloned: GameState = {
-        ...s,
-        cities: s.cities.map((c) => ({ ...c })),
-        bases: s.bases.map((b) => ({ ...b })),
-        flights: s.flights.map((f) => ({ ...f, pos: { ...f.pos }, origin: { ...f.origin }, dest: { ...f.dest } })),
-        log: [...s.log],
-      };
+      const cloned = cloneGameState(s);
       applyPlan(cloned, plan);
       stateRef.current = cloned;
       return cloned;
@@ -116,20 +117,43 @@ const Index = () => {
     kind: MissionKind;
     fighters: number;
     bombers: number;
+    missiles?: number;
   }) => {
     setState((s) => {
-      const cloned: GameState = {
-        ...s,
-        cities: s.cities.map((c) => ({ ...c })),
-        bases: s.bases.map((b) => ({ ...b })),
-        flights: s.flights.map((f) => ({ ...f, pos: { ...f.pos }, origin: { ...f.origin }, dest: { ...f.dest } })),
-        log: [...s.log],
-      };
+      const cloned = cloneGameState(s);
       const base = findBase(cloned, order.fromBaseId);
       const target = findTarget(cloned, order.targetId);
       if (base && target) {
-        launchFlight(cloned, base, target, order.kind, order.fighters, order.bombers);
+        if (order.kind === "missile_strike") {
+          launchMissile(cloned, base, target, order.missiles ?? 0);
+        } else {
+          launchFlight(cloned, base, target, order.kind, order.fighters, order.bombers);
+        }
       }
+      stateRef.current = cloned;
+      return cloned;
+    });
+  };
+
+  const moveSelectedAaTo = (pos: { x: number; y: number }) => {
+    if (!selectedAaId) return;
+    setState((s) => {
+      const aa = s.aaUnits.find((a) => a.id === selectedAaId);
+      if (!aa || aa.hp <= 0) return s;
+      if (!isInOwnLand(aa.faction, pos, s.params.aaCoastBand)) return s;
+      const cloned = cloneGameState(s);
+      const target = cloned.aaUnits.find((a) => a.id === selectedAaId);
+      if (target) target.dest = { ...pos };
+      stateRef.current = cloned;
+      return cloned;
+    });
+  };
+
+  const holdAa = (id: string) => {
+    setState((s) => {
+      const cloned = cloneGameState(s);
+      const target = cloned.aaUnits.find((a) => a.id === id);
+      if (target) target.dest = null;
       stateRef.current = cloned;
       return cloned;
     });
@@ -151,7 +175,15 @@ const Index = () => {
         state.flights.filter((x) => x.faction === faction).reduce((a, x) => a + x.fighters, 0);
       const bm = bases.reduce((a, b) => a + b.bombers, 0) +
         state.flights.filter((x) => x.faction === faction).reduce((a, x) => a + x.bombers, 0);
-      return { f, bm, basesAlive: bases.filter((b) => b.hp > 0).length, citiesAlive: state.cities.filter((c) => c.faction === faction && c.hp > 0).length };
+      const m = bases.reduce((a, b) => a + b.missiles, 0) +
+        state.flights.filter((x) => x.faction === faction).reduce((a, x) => a + x.missiles, 0);
+      const aa = state.aaUnits.filter((a) => a.faction === faction && a.hp > 0).length;
+      return {
+        f, bm, m, aa,
+        credits: Math.floor(state.credits[faction]),
+        basesAlive: bases.filter((b) => b.hp > 0).length,
+        citiesAlive: state.cities.filter((c) => c.faction === faction && c.hp > 0).length,
+      };
     };
     return { north: sum("north"), south: sum("south") };
   }, [state]);
@@ -207,9 +239,16 @@ const Index = () => {
             <ParametersPanel params={params} onChange={setParams} onReset={reset} />
           </aside>
         )}
-        <div className="relative bg-terrain-sea">
+        <div className="relative bg-terrain-sea lg:sticky lg:top-0 lg:self-start lg:h-[calc(100vh-57px)]">
           <div className="absolute inset-0">
-            <GameMap state={state} hoverId={hoverId} onHover={setHoverId} />
+            <GameMap
+              state={state}
+              hoverId={hoverId}
+              onHover={setHoverId}
+              selectedAaId={selectedAaId}
+              onSelectAa={setSelectedAaId}
+              onMapClick={moveSelectedAaTo}
+            />
           </div>
           {state.winner && (
             <div className="absolute inset-0 flex items-center justify-center bg-background/70 backdrop-blur-sm">
@@ -255,6 +294,12 @@ const Index = () => {
                 onExecutePlan={executePlan}
               />
               <ManualOrderPanel state={state} onDispatch={dispatchManual} />
+              <AAControlPanel
+                state={state}
+                selectedAaId={selectedAaId}
+                onSelect={setSelectedAaId}
+                onHold={holdAa}
+              />
             </div>
           </div>
 
@@ -307,14 +352,18 @@ function FactionStat({
 }: {
   label: string;
   color: "north" | "south";
-  data: { f: number; bm: number; basesAlive: number; citiesAlive: number };
+  data: { f: number; bm: number; m: number; aa: number; credits: number; basesAlive: number; citiesAlive: number };
 }) {
   const text = color === "north" ? "text-north" : "text-south";
   return (
-    <div className="rounded-md border border-border p-2">
-      <p className={`text-[10px] uppercase tracking-widest ${text}`}>{label}</p>
+    <div className="rounded-md border border-border p-2 space-y-0.5">
+      <div className="flex items-center justify-between">
+        <p className={`text-[10px] uppercase tracking-widest ${text}`}>{label}</p>
+        <p className="font-mono text-[10px] text-amber-500">¢{data.credits}</p>
+      </div>
       <p className="font-mono">{data.f}F · {data.bm}B</p>
-      <p className="text-muted-foreground">
+      <p className="font-mono text-[10px]">{data.m}× missile · {data.aa} AA</p>
+      <p className="text-muted-foreground text-[10px]">
         Bases {data.basesAlive} · Cities {data.citiesAlive}
       </p>
     </div>

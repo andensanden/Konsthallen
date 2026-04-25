@@ -10,7 +10,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { GameState, MissionKind } from "@/game/types";
-import { dist, fuelNeeded, launchFlight, findBase, findTarget } from "@/game/engine";
+import { dist, fuelNeeded, findTarget } from "@/game/engine";
 import { Send } from "lucide-react";
 
 interface Props {
@@ -21,6 +21,7 @@ interface Props {
     kind: MissionKind;
     fighters: number;
     bombers: number;
+    missiles?: number;
   }) => void;
 }
 
@@ -29,6 +30,7 @@ export function ManualOrderPanel({ state, onDispatch }: Props) {
   const [targetId, setTargetId] = useState<string>("");
   const [fighters, setFighters] = useState<string>("0");
   const [bombers, setBombers] = useState<string>("0");
+  const [missiles, setMissiles] = useState<string>("0");
   const [error, setError] = useState<string | null>(null);
 
   const friendlyBases = useMemo(
@@ -68,17 +70,32 @@ export function ManualOrderPanel({ state, onDispatch }: Props) {
 
   const fNum = Math.max(0, Math.floor(Number(fighters) || 0));
   const bNum = Math.max(0, Math.floor(Number(bombers) || 0));
+  const mNum = Math.max(0, Math.floor(Number(missiles) || 0));
+
+  // Determine final mission kind: if any missiles assigned and target is enemy, fire as missile_strike
+  const finalKind: MissionKind | null = (() => {
+    if (!selectedTarget) return null;
+    if (mNum > 0 && fNum === 0 && bNum === 0 && selectedTarget.kind !== "transfer") {
+      return "missile_strike";
+    }
+    return selectedTarget.kind;
+  })();
 
   const validation = (() => {
     if (!fromBase) return "Pick a launching base.";
     if (!selectedTarget) return "Pick a destination.";
-    if (fNum + bNum <= 0) return "Assign at least 1 aircraft.";
+    if (fNum + bNum + mNum <= 0) return "Assign at least 1 unit.";
+    if (mNum > 0 && (fNum > 0 || bNum > 0)) return "Missiles must launch alone.";
+    if (mNum > 0 && selectedTarget.kind === "transfer") return "Cannot missile a friendly base.";
     if (fNum > fromBase.fighters) return `Only ${fromBase.fighters} fighters at ${fromBase.name}.`;
     if (bNum > fromBase.bombers) return `Only ${fromBase.bombers} bombers at ${fromBase.name}.`;
+    if (mNum > fromBase.missiles) return `Only ${fromBase.missiles} missiles at ${fromBase.name}.`;
     const target = findTarget(state, selectedTarget.id);
     if (!target) return "Target unavailable.";
-    const required = fuelNeeded(state, fromBase.pos, target.pos, selectedTarget.kind !== "transfer");
-    if (required > state.params.maxFuel) return `Out of range (${Math.round(required)} > ${state.params.maxFuel}).`;
+    const isMissile = finalKind === "missile_strike";
+    const required = fuelNeeded(state, fromBase.pos, target.pos, !isMissile && selectedTarget.kind !== "transfer");
+    const cap = isMissile ? state.params.missileMaxFuel : state.params.maxFuel;
+    if (required > cap) return `Out of range (${Math.round(required)} > ${Math.round(cap)}).`;
     return null;
   })();
 
@@ -95,12 +112,14 @@ export function ManualOrderPanel({ state, onDispatch }: Props) {
     onDispatch({
       fromBaseId: fromBase!.id,
       targetId: selectedTarget!.id,
-      kind: selectedTarget!.kind,
+      kind: finalKind!,
       fighters: fNum,
       bombers: bNum,
+      missiles: mNum,
     });
     setFighters("0");
     setBombers("0");
+    setMissiles("0");
   };
 
   return (
@@ -111,7 +130,7 @@ export function ManualOrderPanel({ state, onDispatch }: Props) {
         </p>
         {fromBase && (
           <p className="text-[9px] font-mono text-muted-foreground">
-            avail {fromBase.fighters}F · {fromBase.bombers}B
+            avail {fromBase.fighters}F · {fromBase.bombers}B · {fromBase.missiles}M
           </p>
         )}
       </div>
@@ -126,7 +145,7 @@ export function ManualOrderPanel({ state, onDispatch }: Props) {
             <SelectContent>
               {friendlyBases.map((b) => (
                 <SelectItem key={b.id} value={b.id} className="text-xs">
-                  {b.name} ({b.faction}) · {b.fighters}F/{b.bombers}B
+                  {b.name} ({b.faction}) · {b.fighters}F/{b.bombers}B/{b.missiles}M
                 </SelectItem>
               ))}
             </SelectContent>
@@ -150,9 +169,9 @@ export function ManualOrderPanel({ state, onDispatch }: Props) {
         </div>
       </div>
 
-      <div className="grid grid-cols-2 gap-2">
+      <div className="grid grid-cols-3 gap-2">
         <div className="space-y-1">
-          <Label className="text-[10px] text-muted-foreground">Fighters (X)</Label>
+          <Label className="text-[10px] text-muted-foreground">Fighters</Label>
           <Input
             type="number"
             min={0}
@@ -162,7 +181,7 @@ export function ManualOrderPanel({ state, onDispatch }: Props) {
           />
         </div>
         <div className="space-y-1">
-          <Label className="text-[10px] text-muted-foreground">Bombers (Y)</Label>
+          <Label className="text-[10px] text-muted-foreground">Bombers</Label>
           <Input
             type="number"
             min={0}
@@ -171,11 +190,21 @@ export function ManualOrderPanel({ state, onDispatch }: Props) {
             className="h-8 text-xs"
           />
         </div>
+        <div className="space-y-1">
+          <Label className="text-[10px] text-muted-foreground">Missiles</Label>
+          <Input
+            type="number"
+            min={0}
+            value={missiles}
+            onChange={(e) => setMissiles(e.target.value)}
+            className="h-8 text-xs"
+          />
+        </div>
       </div>
 
       <div className="flex items-center justify-between text-[10px] text-muted-foreground font-mono">
         <span>
-          {selectedTarget ? `mission: ${selectedTarget.kind.replace("_", " ")}` : "—"}
+          {finalKind ? `mission: ${finalKind.replace("_", " ")}` : "—"}
         </span>
         <span>{distance !== null ? `dist ${distance}` : ""}</span>
       </div>
@@ -192,7 +221,7 @@ export function ManualOrderPanel({ state, onDispatch }: Props) {
         onClick={submit}
         disabled={!!validation}
       >
-        <Send className="size-3 mr-1" /> Dispatch flight
+        <Send className="size-3 mr-1" /> Dispatch
       </Button>
     </div>
   );

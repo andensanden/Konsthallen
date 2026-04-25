@@ -1,7 +1,5 @@
-// ai.ts
-
-import { dist, fuelNeeded, launchFlight, log } from "./engine";
-import { AirBase, City, Faction, Flight, GameState } from "./types";
+import { dist, fuelNeeded, isInOwnLand, launchFlight, launchMissile, log, purchaseUnit, PurchaseKind } from "./engine";
+import { AAUnit, AirBase, City, Faction, Flight, GameState } from "./types";
 import { applyPlan, bestPlanFor, rankedPlansFor } from "./strategy";
 import { NeuralNetwork } from "./ai_network"; 
 
@@ -212,6 +210,56 @@ export function allMovesFor(s: GameState, faction: Faction): Suggestion[] {
         },
       });
     }
+
+    // ---- Missile strike: cheap chip damage on enemy bases or cities, no escort
+    if (base.missiles > 0) {
+      const allTargets: Array<AirBase | City> = [...enemyBases, ...enemyCities];
+      for (const t of allTargets) {
+        const oneWay = fuelNeeded(s, base.pos, t.pos, false);
+        if (oneWay > s.params.missileMaxFuel) continue;
+        const useM = Math.min(base.missiles, "isCapital" in t && t.isCapital ? 4 : 2);
+        if (useM <= 0) continue;
+        const value = targetValue(t);
+        const score = value * 0.6 + useM * 5 - dist(base.pos, t.pos) * 0.03;
+        const tIsBase = "fighters" in t;
+        candidates.push({
+          score,
+          faction,
+          kind: tIsBase ? "attack_base" : "attack_city",
+          description: `Missile ${t.name} from ${base.name} (${useM}× missile)`,
+          fromBaseId: base.id,
+          fromBaseName: base.name,
+          targetId: t.id,
+          targetName: t.name,
+          fighters: 0,
+          bombers: 0,
+          apply: (st) => {
+            const b = st.bases.find((x) => x.id === base.id)!;
+            const tt = tIsBase
+              ? st.bases.find((x) => x.id === t.id)!
+              : st.cities.find((x) => x.id === t.id)!;
+            launchMissile(st, b, tt, useM);
+          },
+        });
+      }
+    }
+  }
+
+  // Defensive consideration: if my own city is under heavy threat and we have no plan, prioritize transfer of fighters to nearest friendly base near it.
+  for (const city of myCities) {
+    const threat = inFlightThreatTo(s, city);
+    if (threat <= 0) continue;
+    // boost any transfer suggestion landing at the base nearest this city
+    let nearest = myBases[0];
+    let nd = nearest ? dist(nearest.pos, city.pos) : Infinity;
+    for (const b of myBases) {
+      const d = dist(b.pos, city.pos);
+      if (d < nd) { nd = d; nearest = b; }
+    }
+    if (!nearest) continue;
+    for (const c of candidates) {
+      if (c.description.includes(nearest.name)) c.score += threat * 4;
+    }
   }
 
   candidates.sort((a, b) => b.score - a.score);
@@ -226,6 +274,13 @@ export function bestMoveFor(s: GameState, faction: Faction): Suggestion | null {
 export function runAITick(s: GameState) {
   const p = s.params;
 
+  // Economy + ground AA management runs every tick (cheap)
+  manageEconomy(s, "south");
+  manageEconomy(s, "north");
+  manageAA(s, "south");
+  manageAA(s, "north");
+
+  // -------- SOUTH: attacker (Monte Carlo) --------
   if (s.time >= s.nextWaveAt) {
     s.waveNumber += 1;
     const waveSize = p.southWaveBase + Math.floor(Math.random() * 3) + Math.floor(s.waveNumber / 2);
@@ -253,6 +308,93 @@ export function runAITick(s: GameState) {
   if (s.time >= s.northThinkAt) {
     s.northThinkAt = s.time + p.northThinkInterval;
     runNorthDefender(s);
+  }
+}
+
+// ============================================================
+// Economy: each side autonomously buys units it needs
+// ============================================================
+function manageEconomy(s: GameState, faction: Faction) {
+  const credits = s.credits[faction];
+  const c = s.params.costs;
+  if (credits < c.missile) return;
+
+  const myBases = s.bases.filter((b) => b.faction === faction && b.hp > 0);
+  if (myBases.length === 0) return;
+
+  const myFighters = myBases.reduce((a, b) => a + b.fighters, 0);
+  const myBombers  = myBases.reduce((a, b) => a + b.bombers, 0);
+  const myMissiles = myBases.reduce((a, b) => a + b.missiles, 0);
+  const myAA = s.aaUnits.filter((a) => a.faction === faction && a.hp > 0).length;
+
+  const wishlist: PurchaseKind[] = faction === "south"
+    ? buildWishlist({ missile: 12, bomber: 8, fighter: 10, aa: 3 }, { missile: myMissiles, bomber: myBombers, fighter: myFighters, aa: myAA })
+    : buildWishlist({ fighter: 14, aa: 5, missile: 8, bomber: 4 }, { missile: myMissiles, bomber: myBombers, fighter: myFighters, aa: myAA });
+
+  let budget = credits * 0.4;
+  for (const kind of wishlist) {
+    const price = kind === "fighter" ? c.fighter : kind === "bomber" ? c.bomber : kind === "missile" ? c.missile : c.aa;
+    if (budget < price) continue;
+    if (purchaseUnit(s, faction, kind)) budget -= price;
+  }
+}
+
+function buildWishlist(
+  target: Record<PurchaseKind, number>,
+  current: Record<PurchaseKind, number>,
+): PurchaseKind[] {
+  const kinds: PurchaseKind[] = ["fighter", "bomber", "missile", "aa"];
+  const scored = kinds
+    .map((k) => ({ k, deficit: (target[k] - current[k]) / Math.max(1, target[k]) }))
+    .filter((x) => x.deficit > 0)
+    .sort((a, b) => b.deficit - a.deficit);
+  const out: PurchaseKind[] = [];
+  for (const x of scored) {
+    const reps = Math.min(3, Math.ceil(x.deficit * 4));
+    for (let i = 0; i < reps; i++) out.push(x.k);
+  }
+  return out;
+}
+
+// ============================================================
+// AA management: position batteries near most-threatened assets
+// ============================================================
+function manageAA(s: GameState, faction: Faction) {
+  const myAA = s.aaUnits.filter((a) => a.faction === faction && a.hp > 0);
+  if (myAA.length === 0) return;
+
+  const assets: Array<{ pos: { x: number; y: number }; weight: number }> = [];
+  for (const c of s.cities) {
+    if (c.faction !== faction || c.hp <= 0) continue;
+    let threat = 0;
+    for (const f of s.flights) {
+      if (f.faction === faction) continue;
+      if (f.targetId === c.id) threat += f.bombers * 2 + f.fighters * 0.5 + f.missiles * 1.5;
+    }
+    if (threat > 0 || c.isCapital) assets.push({ pos: c.pos, weight: threat + (c.isCapital ? 6 : 1) });
+  }
+  for (const b of s.bases) {
+    if (b.faction !== faction || b.hp <= 0) continue;
+    let threat = 0;
+    for (const f of s.flights) {
+      if (f.faction === faction) continue;
+      if (f.targetId === b.id) threat += f.bombers * 2 + f.fighters * 0.5 + f.missiles * 1.5;
+    }
+    if (threat > 0) assets.push({ pos: b.pos, weight: threat });
+  }
+  if (assets.length === 0) return;
+
+  for (const aa of myAA) {
+    if (aa.dest) continue;
+    let best: { pos: { x: number; y: number }; weight: number } | null = null;
+    let bestScore = -Infinity;
+    for (const a of assets) {
+      if (!isInOwnLand(faction, a.pos, s.params.aaCoastBand)) continue;
+      const d = dist(aa.pos, a.pos);
+      const score = a.weight * 10 - d * 0.05;
+      if (score > bestScore) { bestScore = score; best = a; }
+    }
+    if (best && dist(aa.pos, best.pos) > 30) aa.dest = { ...best.pos };
   }
 }
 

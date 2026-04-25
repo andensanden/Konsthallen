@@ -16,6 +16,8 @@ export function cloneState(s: GameState): GameState {
       origin: { ...f.origin },
       dest: { ...f.dest },
     })),
+    aaUnits: s.aaUnits.map((a) => ({ ...a, pos: { ...a.pos }, dest: a.dest ? { ...a.dest } : null })),
+    credits: { ...s.credits },
     log: [...s.log],
   };
 }
