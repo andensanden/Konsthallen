@@ -8,7 +8,25 @@ import { Badge } from "@/components/ui/badge";
 import { createInitialState, DEFAULT_PARAMS } from "@/game/initial";
 import { GameState, SimParams } from "@/game/types";
 import { tick } from "@/game/engine";
-import { bestMoveFor, runAITick } from "@/game/ai";
+import { allMovesFor, runAITick, Suggestion } from "@/game/ai";
+import { applyPlan, CoordinatedPlan, rankedPlansFor } from "@/game/strategy";
+import { AdvisorPanel } from "@/components/AdvisorPanel";
+import { ManualOrderPanel } from "@/components/ManualOrderPanel";
+import { AAControlPanel } from "@/components/AAControlPanel";
+import { launchFlight, launchMissile, findBase, findTarget, isInOwnLand } from "@/game/engine";
+import { MissionKind } from "@/game/types";
+
+function cloneGameState(s: GameState): GameState {
+  return {
+    ...s,
+    cities: s.cities.map((c) => ({ ...c })),
+    bases: s.bases.map((b) => ({ ...b })),
+    flights: s.flights.map((f) => ({ ...f, pos: { ...f.pos }, origin: { ...f.origin }, dest: { ...f.dest } })),
+    aaUnits: s.aaUnits.map((a) => ({ ...a, pos: { ...a.pos }, dest: a.dest ? { ...a.dest } : null })),
+    credits: { ...s.credits },
+    log: [...s.log],
+  };
+}
 import { Pause, Play, RotateCcw, Gauge, Sliders } from "lucide-react";
 
 const Index = () => {
@@ -16,6 +34,7 @@ const Index = () => {
   const [state, setState] = useState<GameState>(() => createInitialState(DEFAULT_PARAMS));
   const [hoverId, setHoverId] = useState<string | null>(null);
   const [showParams, setShowParams] = useState(true);
+  const [selectedAaId, setSelectedAaId] = useState<string | null>(null);
   const stateRef = useRef(state);
   stateRef.current = state;
 
@@ -43,14 +62,13 @@ const Index = () => {
       const dt = Math.min(0.1, (now - last) / 1000);
       last = now;
       const s = { ...stateRef.current };
-      // mutate clone (deep enough for our arrays — but engine mutates references)
-      // Since engine mutates objects, we need a true mutable copy for React to re-render
-      // We'll deep-clone the parts that mutate.
       const cloned: GameState = {
         ...s,
         cities: s.cities.map((c) => ({ ...c })),
         bases: s.bases.map((b) => ({ ...b })),
         flights: s.flights.map((f) => ({ ...f, pos: { ...f.pos }, origin: { ...f.origin }, dest: { ...f.dest } })),
+        aaUnits: s.aaUnits.map((a) => ({ ...a, pos: { ...a.pos }, dest: a.dest ? { ...a.dest } : null })),
+        credits: { ...s.credits },
         log: [...s.log],
       };
       tick(cloned, dt);
@@ -68,8 +86,78 @@ const Index = () => {
   const setSpeed = (sp: number) => setState((s) => ({ ...s, speed: sp }));
   const reset = () => setState(createInitialState(params));
 
-  const northSuggestion = useMemo(() => bestMoveFor(state, "north"), [state]);
-  const southSuggestion = useMemo(() => bestMoveFor(state, "south"), [state]);
+  const northMoves = useMemo(() => allMovesFor(state, "north"), [state]);
+  const southMoves = useMemo(() => allMovesFor(state, "south"), [state]);
+  // Lookahead is expensive — recompute on a slow tick (every ~1s of sim time)
+  const planTick = Math.floor(state.time);
+  const northPlans = useMemo(() => rankedPlansFor(state, "north"), [planTick, state.bases.length, state.flights.length]);
+  const southPlans = useMemo(() => rankedPlansFor(state, "south"), [planTick, state.bases.length, state.flights.length]);
+
+  const executeSuggestion = (sug: Suggestion) => {
+    setState((s) => {
+      const cloned = cloneGameState(s);
+      sug.apply(cloned);
+      stateRef.current = cloned;
+      return cloned;
+    });
+  };
+
+  const executePlan = (plan: CoordinatedPlan) => {
+    setState((s) => {
+      const cloned = cloneGameState(s);
+      applyPlan(cloned, plan);
+      stateRef.current = cloned;
+      return cloned;
+    });
+  };
+
+  const dispatchManual = (order: {
+    fromBaseId: string;
+    targetId: string;
+    kind: MissionKind;
+    fighters: number;
+    bombers: number;
+    missiles?: number;
+  }) => {
+    setState((s) => {
+      const cloned = cloneGameState(s);
+      const base = findBase(cloned, order.fromBaseId);
+      const target = findTarget(cloned, order.targetId);
+      if (base && target) {
+        if (order.kind === "missile_strike") {
+          launchMissile(cloned, base, target, order.missiles ?? 0);
+        } else {
+          launchFlight(cloned, base, target, order.kind, order.fighters, order.bombers);
+        }
+      }
+      stateRef.current = cloned;
+      return cloned;
+    });
+  };
+
+  const moveSelectedAaTo = (pos: { x: number; y: number }) => {
+    if (!selectedAaId) return;
+    setState((s) => {
+      const aa = s.aaUnits.find((a) => a.id === selectedAaId);
+      if (!aa || aa.hp <= 0) return s;
+      if (!isInOwnLand(aa.faction, pos, s.params.aaCoastBand)) return s;
+      const cloned = cloneGameState(s);
+      const target = cloned.aaUnits.find((a) => a.id === selectedAaId);
+      if (target) target.dest = { ...pos };
+      stateRef.current = cloned;
+      return cloned;
+    });
+  };
+
+  const holdAa = (id: string) => {
+    setState((s) => {
+      const cloned = cloneGameState(s);
+      const target = cloned.aaUnits.find((a) => a.id === id);
+      if (target) target.dest = null;
+      stateRef.current = cloned;
+      return cloned;
+    });
+  };
 
   const hovered = useMemo(() => {
     if (!hoverId) return null;
@@ -87,7 +175,15 @@ const Index = () => {
         state.flights.filter((x) => x.faction === faction).reduce((a, x) => a + x.fighters, 0);
       const bm = bases.reduce((a, b) => a + b.bombers, 0) +
         state.flights.filter((x) => x.faction === faction).reduce((a, x) => a + x.bombers, 0);
-      return { f, bm, basesAlive: bases.filter((b) => b.hp > 0).length, citiesAlive: state.cities.filter((c) => c.faction === faction && c.hp > 0).length };
+      const m = bases.reduce((a, b) => a + b.missiles, 0) +
+        state.flights.filter((x) => x.faction === faction).reduce((a, x) => a + x.missiles, 0);
+      const aa = state.aaUnits.filter((a) => a.faction === faction && a.hp > 0).length;
+      return {
+        f, bm, m, aa,
+        credits: Math.floor(state.credits[faction]),
+        basesAlive: bases.filter((b) => b.hp > 0).length,
+        citiesAlive: state.cities.filter((c) => c.faction === faction && c.hp > 0).length,
+      };
     };
     return { north: sum("north"), south: sum("south") };
   }, [state]);
@@ -97,7 +193,7 @@ const Index = () => {
       <header className="border-b border-border px-4 py-3 flex items-center justify-between">
         <div>
           <h1 className="text-lg font-semibold tracking-wide">Boreal Passage — Air Theater</h1>
-          <p className="text-xs text-muted-foreground">Observer mode · heuristic strategy advisor</p>
+          <p className="text-xs text-muted-foreground">South: Monte Carlo attacker · North: risk-min defender</p>
         </div>
         <div className="flex items-center gap-2">
           <Button size="sm" variant="secondary" onClick={togglePause}>
@@ -143,9 +239,16 @@ const Index = () => {
             <ParametersPanel params={params} onChange={setParams} onReset={reset} />
           </aside>
         )}
-        <div className="relative bg-terrain-sea">
+        <div className="relative bg-terrain-sea lg:sticky lg:top-0 lg:self-start lg:h-[calc(100vh-57px)]">
           <div className="absolute inset-0">
-            <GameMap state={state} hoverId={hoverId} onHover={setHoverId} />
+            <GameMap
+              state={state}
+              hoverId={hoverId}
+              onHover={setHoverId}
+              selectedAaId={selectedAaId}
+              onSelectAa={setSelectedAaId}
+              onMapClick={moveSelectedAaTo}
+            />
           </div>
           {state.winner && (
             <div className="absolute inset-0 flex items-center justify-center bg-background/70 backdrop-blur-sm">
@@ -166,10 +269,38 @@ const Index = () => {
             <FactionStat label="South" color="south" data={totals.south} />
           </div>
 
-          <div className="p-3 border-b border-border space-y-2">
-            <p className="text-[10px] uppercase tracking-widest text-muted-foreground">Strategy Advisor</p>
-            <SuggestionRow label="North" sug={northSuggestion} color="north" />
-            <SuggestionRow label="South" sug={southSuggestion} color="south" />
+          <div className="border-b border-border max-h-[55vh] overflow-y-auto">
+            <div className="p-3 space-y-2">
+              <div className="flex items-center justify-between">
+                <p className="text-[10px] uppercase tracking-widest text-muted-foreground">
+                  Strategy Advisor
+                </p>
+                <p className="text-[9px] text-muted-foreground">
+                  two-sided AI · click Run to override
+                </p>
+              </div>
+              <AdvisorPanel
+                faction="north"
+                suggestions={northMoves}
+                plans={northPlans}
+                onExecute={executeSuggestion}
+                onExecutePlan={executePlan}
+              />
+              <AdvisorPanel
+                faction="south"
+                suggestions={southMoves}
+                plans={southPlans}
+                onExecute={executeSuggestion}
+                onExecutePlan={executePlan}
+              />
+              <ManualOrderPanel state={state} onDispatch={dispatchManual} />
+              <AAControlPanel
+                state={state}
+                selectedAaId={selectedAaId}
+                onSelect={setSelectedAaId}
+                onHold={holdAa}
+              />
+            </div>
           </div>
 
           {hovered && (
@@ -221,43 +352,23 @@ function FactionStat({
 }: {
   label: string;
   color: "north" | "south";
-  data: { f: number; bm: number; basesAlive: number; citiesAlive: number };
+  data: { f: number; bm: number; m: number; aa: number; credits: number; basesAlive: number; citiesAlive: number };
 }) {
   const text = color === "north" ? "text-north" : "text-south";
   return (
-    <div className="rounded-md border border-border p-2">
-      <p className={`text-[10px] uppercase tracking-widest ${text}`}>{label}</p>
+    <div className="rounded-md border border-border p-2 space-y-0.5">
+      <div className="flex items-center justify-between">
+        <p className={`text-[10px] uppercase tracking-widest ${text}`}>{label}</p>
+        <p className="font-mono text-[10px] text-amber-500">¢{data.credits}</p>
+      </div>
       <p className="font-mono">{data.f}F · {data.bm}B</p>
-      <p className="text-muted-foreground">
+      <p className="font-mono text-[10px]">{data.m}× missile · {data.aa} AA</p>
+      <p className="text-muted-foreground text-[10px]">
         Bases {data.basesAlive} · Cities {data.citiesAlive}
       </p>
     </div>
   );
 }
 
-function SuggestionRow({
-  label,
-  sug,
-  color,
-}: {
-  label: string;
-  sug: ReturnType<typeof bestMoveFor>;
-  color: "north" | "south";
-}) {
-  const text = color === "north" ? "text-north" : "text-south";
-  return (
-    <div className="text-xs">
-      <span className={`font-medium ${text}`}>{label}: </span>
-      {sug ? (
-        <span>
-          {sug.description}{" "}
-          <span className="text-muted-foreground">({sug.score.toFixed(0)})</span>
-        </span>
-      ) : (
-        <span className="text-muted-foreground">holding position</span>
-      )}
-    </div>
-  );
-}
 
 export default Index;
